@@ -1,0 +1,23 @@
+{
+  "citation": "",
+  "description": "",
+  "features": {
+    "image": {
+      "_type": "Image"
+    },
+    "query": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "label": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "dataset_source": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": ""
+}

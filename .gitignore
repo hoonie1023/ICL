@@ -1,0 +1,20 @@
+# 忽略模型权重文件
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+
+# 忽略数据集和缓存
+__pycache__/
+*.npy
+*.npz
+.ipynb_checkpoints/
+dataset/
+data/
+*.parquet
+
+# 忽略虚拟环境
+venv/
+env/
+.conda/

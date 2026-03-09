@@ -1,0 +1,23 @@
+{
+  "citation": "",
+  "description": "",
+  "features": {
+    "target_index": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "demo_indices": {
+      "feature": {
+        "dtype": "int64",
+        "_type": "Value"
+      },
+      "_type": "List"
+    },
+    "source": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": ""
+}
