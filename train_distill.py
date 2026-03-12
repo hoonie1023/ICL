@@ -365,9 +365,9 @@ def main() -> None:
                 teacher_texts.append(demo_text)
                 teacher_images.append(decode_image_field(ex_demo.get("image", None)))
 
-            # 最后一条是 Target Query：图文 + 不含答案
-            q_target, _ = extract_qa_from_raw(target_raw, source=source)
-            target_teacher_text = build_qa_text(q_target, None, with_vision_prefix=True)
+            # 最后一条是 Target Query：图文 + 完整真实答案（用于序列级蒸馏）
+            q_target, a_target = extract_qa_from_raw(target_raw, source=source)
+            target_teacher_text = build_qa_text(q_target, a_target, with_vision_prefix=True)
             teacher_texts.append(target_teacher_text)
             teacher_images.append(decode_image_field(target_raw.get("image", None)))
 
@@ -382,23 +382,19 @@ def main() -> None:
                 teacher_inputs = {k: v.to(device) for k, v in teacher_inputs.items()}
 
                 teacher_outputs = model(**teacher_inputs)
-                teacher_logits_all = teacher_outputs.logits  # [B,D,V]
-                teacher_attn_mask = teacher_inputs["attention_mask"]
+                teacher_logits_all = teacher_outputs.logits  # [B,S,V]
 
-                # 取每个样本最后一个非 pad token 的 logits，这里我们只需要 batch 中最后一条（Target）
-                final_logits = get_last_token_logits(teacher_logits_all, teacher_attn_mask)  # [B,V]
-                teacher_logits = final_logits[-1:].contiguous()  # [1, V]
-
-                # 温度平滑 + softmax -> 概率分布
-                T = cfg.TEMPERATURE
-                teacher_probs = F.softmax(teacher_logits / T, dim=-1)  # [1,V]
+                # 仅保留 batch 中最后一条（Target）的完整序列 logits
+                teacher_logits_seq = teacher_logits_all[-1:, :, :]  # [1,S,V]
+                # 提前提取出 target 的 mask，防止后续被 del 掉
+                teacher_target_mask = teacher_inputs["attention_mask"][-1:].clone()
 
             # 释放 Teacher 中间张量，缓解显存压力
-            del teacher_outputs, teacher_logits_all, teacher_inputs, final_logits
+            del teacher_outputs, teacher_logits_all, teacher_inputs
             torch.cuda.empty_cache() if device.type == "cuda" else None
 
-            # ========== 3.2 构造 Student 0-shot 输入（仅使用 target 图文） ==========
-            student_text = build_qa_text(q_target, None, with_vision_prefix=True)
+            # ========== 3.2 构造 Student 0-shot 输入（仅使用 target 图文 + 真实答案） ==========
+            student_text = build_qa_text(q_target, a_target, with_vision_prefix=True)
             student_image = decode_image_field(target_raw.get("image", None))
 
             student_inputs = processor(
@@ -443,19 +439,62 @@ def main() -> None:
             moicv_reg_loss = outputs["moicv_loss"]  # alpha * balance + beta * ortho
             syn_loss = outputs.get("syn_loss", torch.tensor(0.0, device=device))
 
-            # Student logits -> 取最后一个非 pad token 的 logits
             student_logits_all = llm_outputs["logits"] if isinstance(llm_outputs, dict) else llm_outputs.logits
-            student_final_logits = get_last_token_logits(student_logits_all, attention_mask)  # [1,V]
+            student_logits_seq = student_logits_all  # [1,S,V]
 
+            # ======== 1. 精准构造 Loss Mask (避开多模态 Tokenizer 陷阱) ========
+            # 核心思路：分别过一次 processor 拿 prompt 的实际 token 长度，后面的自然就是答案
+            prompt_text = build_qa_text(q_target, None, with_vision_prefix=True)
+            with torch.no_grad():
+                prompt_inputs = processor(
+                    text=[prompt_text],
+                    images=[student_image],
+                    return_tensors="pt",
+                )
+            prompt_len = prompt_inputs["input_ids"].size(1)
+            seq_len = input_ids.size(1)
+
+            loss_mask = torch.zeros((1, seq_len), device=device, dtype=torch.float32)
+            if seq_len > prompt_len:
+                loss_mask[0, prompt_len:] = 1.0  # 答案部分标记为 1
+
+            # 乘以 attention_mask 排除 pad 的影响
+            loss_mask = loss_mask * attention_mask.float()  # [1, S]
+
+            # ======== 2. 截取 Teacher Logits 消除 Batch Padding 差异 ========
+            valid_len = int(teacher_target_mask.sum().item())            # 目标样本的无 pad 真实长度
+
+            # 根据 Qwen 的 padding_side 取出有效 logits (通常 Qwen 是 left padding，但做一下兼容防御)
+            if processor.tokenizer.padding_side == "left":
+                clean_teacher_logits = teacher_logits_seq[:, -valid_len:, :]
+            else:
+                clean_teacher_logits = teacher_logits_seq[:, :valid_len, :]
+
+            # 此时 clean_teacher_logits 的长度应该严格等于 student_logits_seq 的非 pad 长度
+            # 为防止多模态 patch 导致的极微小舍入误差，做一次严格对齐防御
+            min_len = min(clean_teacher_logits.size(1), student_logits_seq.size(1))
+            clean_teacher_logits = clean_teacher_logits[:, :min_len, :]
+            clean_student_logits = student_logits_seq[:, :min_len, :]
+            clean_loss_mask = loss_mask[:, :min_len]
+
+            # ======== 3. 序列级模仿损失：含 Shift 对齐 ========
             T = cfg.TEMPERATURE
-            student_logprobs = F.log_softmax(student_final_logits / T, dim=-1)
+            # Shift 操作：用 i 位置的输出对齐 i+1 位置的标签/mask
+            shift_teacher_probs = F.softmax(clean_teacher_logits[:, :-1, :] / T, dim=-1)
+            shift_student_logprobs = F.log_softmax(clean_student_logits[:, :-1, :] / T, dim=-1)
+            shift_loss_mask = clean_loss_mask[:, 1:].contiguous()
 
-            # ======== 模仿损失：KL(student || teacher)，reduction = batchmean ========
-            distill_loss = F.kl_div(
-                student_logprobs,
-                teacher_probs,
-                reduction="batchmean",
-            )
+            # 计算逐 token 的 KL 散度
+            kl_per_token = F.kl_div(
+                shift_student_logprobs,
+                shift_teacher_probs,
+                reduction="none",
+            ).sum(dim=-1)  # [1, S-1]
+
+            # 应用 Mask 并求均值
+            masked_kl = kl_per_token * shift_loss_mask
+            denom = shift_loss_mask.sum().clamp(min=1.0)
+            distill_loss = masked_kl.sum() / denom
 
             # ======== 监督损失 (Supervised CE Loss) ========
             # 对 Student 的完整 logits 与 input_ids 做 causal LM 的 shift 计算交叉熵。
