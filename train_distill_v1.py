@@ -288,14 +288,6 @@ def main() -> None:
     # Student 的 MoICV 层使用 float32 精度，提高数值稳定性
     moicv_layer.to(device=device, dtype=torch.float32)
 
-    # === 加载 Step 3 的 Oracle SFT 预热权重 ===
-    sft_ckpt = "moicv_router_sft.pth"
-    if os.path.exists(sft_ckpt):
-        moicv_layer.load_state_dict(torch.load(sft_ckpt, map_location="cpu"), strict=False)
-        print(f"[INFO][Distill] 成功加载 Router 预热权重: {sft_ckpt}")
-    else:
-        print("[WARN][Distill] 未找到 moicv_router_sft.pth，Router 将从零冷启动！")
-
     # 从 896 维初始化权重文件中加载专家向量，并使用插值拉伸到 hidden_size
     from train import load_and_assign_experts  # 复用已有函数
 
@@ -305,20 +297,20 @@ def main() -> None:
         hidden_size=hidden_size,
     )
 
-    # 构建带注入能力的 Wrapper（Student）——在单一中间层注入 MoICV 向量
+    # 构建带注入能力的 Wrapper（Student）
     wrapper = MoICV_Qwen_Wrapper(
         llm_model=model,
         moicv_layer=moicv_layer,
-        inject_layer_idx=15,
+        attn_inject_layer_idx=cfg.ATTN_INJECT_LAYER_IDX,
+        ffn_inject_layer_idx=cfg.FFN_INJECT_LAYER_IDX,
     )
 
     # MoICV 正则 Loss
     moicv_loss_fn = MoICV_Loss(alpha=cfg.MOICV_ALPHA, beta=cfg.MOICV_BETA)
 
-    # 仅优化 MoICV 路由网络参数（专家向量已被冻结）
-    trainable_params = filter(lambda p: p.requires_grad, moicv_layer.parameters())
+    # 只优化 MoICV 层参数 + 注入强度因子 gamma_attn / gamma_ffn
     optimizer = torch.optim.AdamW(
-        trainable_params,
+        list(moicv_layer.parameters()) + [wrapper.gamma_attn, wrapper.gamma_ffn],
         lr=cfg.LEARNING_RATE,
         weight_decay=cfg.WEIGHT_DECAY,
     )
@@ -327,19 +319,8 @@ def main() -> None:
     print(f"[INFO][Distill] 正在加载预打包 M²IV 数据集：{cfg.DATASET_PATH}")
     hf_dataset = load_from_disk(cfg.DATASET_PATH)
     n_samples = len(hf_dataset)
+    indices = list(range(n_samples))
     print(f"[INFO][Distill] M²IV 蒸馏样本数：{n_samples}")
-
-    # ========= Balanced Domain Sampling =========
-    # 将样本按 source 分组，保证各域在每个 epoch 中被均衡采样
-    sources_all: List[str] = hf_dataset["source"]
-    domain_to_indices: Dict[str, List[int]] = {}
-    for i, s in enumerate(sources_all):
-        domain_to_indices.setdefault(str(s), []).append(i)
-    domains = sorted(domain_to_indices.keys())
-    print(
-        "[INFO][Distill] 领域样本数分布："
-        + ", ".join(f"{d}={len(domain_to_indices[d])}" for d in domains)
-    )
 
     # 同时加载原始 A-OKVQA / CSQA 训练集，用于根据索引还原 target / demos 的图文内容
     print(f"[INFO][Distill] 从 parquet 加载原始 A-OKVQA 训练集：{cfg.AOKVQA_TRAIN_PARQUET}")
@@ -354,25 +335,8 @@ def main() -> None:
     optimizer.zero_grad()
 
     for epoch in range(cfg.NUM_EPOCHS):
-        # 为每个域各自打乱索引
-        for d in domains:
-            rng.shuffle(domain_to_indices[d])
-
-        # 构造平衡采样序列：在各域之间循环，必要时对小域进行重复采样
-        max_len = max(len(domain_to_indices[d]) for d in domains)
-        balanced_indices: List[int] = []
-        for i in range(max_len):
-            for d in domains:
-                idx_list = domain_to_indices[d]
-                if not idx_list:
-                    continue
-                balanced_indices.append(idx_list[i % len(idx_list)])
-
-        epoch_bar = tqdm(
-            balanced_indices,
-            desc=f"[Distill] Epoch {epoch+1}/{cfg.NUM_EPOCHS}",
-            unit="sample",
-        )
+        rng.shuffle(indices)
+        epoch_bar = tqdm(indices, desc=f"[Distill] Epoch {epoch+1}/{cfg.NUM_EPOCHS}", unit="sample")
 
         for step_idx, idx in enumerate(epoch_bar):
             ex_m2iv = hf_dataset[idx]
@@ -401,39 +365,40 @@ def main() -> None:
                 teacher_texts.append(demo_text)
                 teacher_images.append(decode_image_field(ex_demo.get("image", None)))
 
-            # 最后一条是 Target Query：图文 + 完整真实答案（用于序列级蒸馏）
-            q_target, a_target = extract_qa_from_raw(target_raw, source=source)
-            target_teacher_text = build_qa_text(q_target, a_target, with_vision_prefix=True)
+            # 最后一条是 Target Query：图文 + 不含答案
+            q_target, _ = extract_qa_from_raw(target_raw, source=source)
+            target_teacher_text = build_qa_text(q_target, None, with_vision_prefix=True)
             teacher_texts.append(target_teacher_text)
             teacher_images.append(decode_image_field(target_raw.get("image", None)))
-
-            # 【修复点】：将 17 个独立字符串拼成真正的 16-shot 长上下文；Batch Size = 1
-            teacher_16shot_text = "\n\n".join(teacher_texts)
 
             # Teacher 前向（无梯度）
             with torch.no_grad():
                 teacher_inputs = processor(
-                    text=[teacher_16shot_text],
-                    images=[teacher_images],  # 多图作为同一道题的上下文
+                    text=teacher_texts,
+                    images=teacher_images,
                     return_tensors="pt",
                     padding=True,
                 )
                 teacher_inputs = {k: v.to(device) for k, v in teacher_inputs.items()}
 
                 teacher_outputs = model(**teacher_inputs)
-                teacher_logits_all = teacher_outputs.logits  # [1,S,V]
+                teacher_logits_all = teacher_outputs.logits  # [B,D,V]
+                teacher_attn_mask = teacher_inputs["attention_mask"]
 
-                # 仅保留该样本的完整序列 logits
-                teacher_logits_seq = teacher_logits_all  # [1,S,V]
-                # 提前提取出 target 的 mask，防止后续被 del 掉
-                teacher_target_mask = teacher_inputs["attention_mask"].clone()
+                # 取每个样本最后一个非 pad token 的 logits，这里我们只需要 batch 中最后一条（Target）
+                final_logits = get_last_token_logits(teacher_logits_all, teacher_attn_mask)  # [B,V]
+                teacher_logits = final_logits[-1:].contiguous()  # [1, V]
+
+                # 温度平滑 + softmax -> 概率分布
+                T = cfg.TEMPERATURE
+                teacher_probs = F.softmax(teacher_logits / T, dim=-1)  # [1,V]
 
             # 释放 Teacher 中间张量，缓解显存压力
-            del teacher_outputs, teacher_logits_all, teacher_inputs
+            del teacher_outputs, teacher_logits_all, teacher_inputs, final_logits
             torch.cuda.empty_cache() if device.type == "cuda" else None
 
-            # ========== 3.2 构造 Student 0-shot 输入（仅使用 target 图文 + 真实答案） ==========
-            student_text = build_qa_text(q_target, a_target, with_vision_prefix=True)
+            # ========== 3.2 构造 Student 0-shot 输入（仅使用 target 图文） ==========
+            student_text = build_qa_text(q_target, None, with_vision_prefix=True)
             student_image = decode_image_field(target_raw.get("image", None))
 
             student_inputs = processor(
@@ -476,63 +441,21 @@ def main() -> None:
             outputs = wrapper.forward_with_moicv(**wrapper_kwargs)
             llm_outputs = outputs["llm_outputs"]
             moicv_reg_loss = outputs["moicv_loss"]  # alpha * balance + beta * ortho
+            syn_loss = outputs.get("syn_loss", torch.tensor(0.0, device=device))
 
+            # Student logits -> 取最后一个非 pad token 的 logits
             student_logits_all = llm_outputs["logits"] if isinstance(llm_outputs, dict) else llm_outputs.logits
-            student_logits_seq = student_logits_all  # [1,S,V]
+            student_final_logits = get_last_token_logits(student_logits_all, attention_mask)  # [1,V]
 
-            # ======== 1. 精准构造 Loss Mask (避开多模态 Tokenizer 陷阱) ========
-            # 核心思路：分别过一次 processor 拿 prompt 的实际 token 长度，后面的自然就是答案
-            prompt_text = build_qa_text(q_target, None, with_vision_prefix=True)
-            with torch.no_grad():
-                prompt_inputs = processor(
-                    text=[prompt_text],
-                    images=[student_image],
-                    return_tensors="pt",
-                )
-            prompt_len = prompt_inputs["input_ids"].size(1)
-            seq_len = input_ids.size(1)
-
-            loss_mask = torch.zeros((1, seq_len), device=device, dtype=torch.float32)
-            if seq_len > prompt_len:
-                loss_mask[0, prompt_len:] = 1.0  # 答案部分标记为 1
-
-            # 乘以 attention_mask 排除 pad 的影响
-            loss_mask = loss_mask * attention_mask.float()  # [1, S]
-
-            # ======== 2. 截取 Teacher Logits 消除 Batch Padding 差异 ========
-            valid_len = int(teacher_target_mask.sum().item())            # 目标样本的无 pad 真实长度
-
-            # 根据 Qwen 的 padding_side 取出有效 logits (通常 Qwen 是 left padding，但做一下兼容防御)
-            if processor.tokenizer.padding_side == "left":
-                clean_teacher_logits = teacher_logits_seq[:, -valid_len:, :]
-            else:
-                clean_teacher_logits = teacher_logits_seq[:, :valid_len, :]
-
-            # 此时 clean_teacher_logits 的长度应该严格等于 student_logits_seq 的非 pad 长度
-            # 为防止多模态 patch 导致的极微小舍入误差，做一次严格对齐防御
-            min_len = min(clean_teacher_logits.size(1), student_logits_seq.size(1))
-            clean_teacher_logits = clean_teacher_logits[:, :min_len, :]
-            clean_student_logits = student_logits_seq[:, :min_len, :]
-            clean_loss_mask = loss_mask[:, :min_len]
-
-            # ======== 3. 序列级模仿损失：含 Shift 对齐 ========
             T = cfg.TEMPERATURE
-            # Shift 操作：用 i 位置的输出对齐 i+1 位置的标签/mask
-            shift_teacher_probs = F.softmax(clean_teacher_logits[:, :-1, :] / T, dim=-1)
-            shift_student_logprobs = F.log_softmax(clean_student_logits[:, :-1, :] / T, dim=-1)
-            shift_loss_mask = clean_loss_mask[:, 1:].contiguous()
+            student_logprobs = F.log_softmax(student_final_logits / T, dim=-1)
 
-            # 计算逐 token 的 KL 散度
-            kl_per_token = F.kl_div(
-                shift_student_logprobs,
-                shift_teacher_probs,
-                reduction="none",
-            ).sum(dim=-1)  # [1, S-1]
-
-            # 应用 Mask 并求均值
-            masked_kl = kl_per_token * shift_loss_mask
-            denom = shift_loss_mask.sum().clamp(min=1.0)
-            distill_loss = masked_kl.sum() / denom
+            # ======== 模仿损失：KL(student || teacher)，reduction = batchmean ========
+            distill_loss = F.kl_div(
+                student_logprobs,
+                teacher_probs,
+                reduction="batchmean",
+            )
 
             # ======== 监督损失 (Supervised CE Loss) ========
             # 对 Student 的完整 logits 与 input_ids 做 causal LM 的 shift 计算交叉熵。
@@ -554,10 +477,12 @@ def main() -> None:
             # ======== 融合多重损失 (Loss Integration) ========
             # 1. 模仿损失: distill_loss (self-distillation)
             # 2. 监督损失: ce_loss (supervised CE)
-            # 3. MoICV 路由正则: moicv_reg_loss (balance + ortho)
+            # 3. 协同损失: syn_loss (M²IV Synergistic Loss)
+            # 4. MoICV 路由正则: moicv_reg_loss (balance + ortho)
             total_loss = (
                 cfg.LAMBDA_MIM * distill_loss
                 + cfg.LAMBDA_SUP * ce_loss
+                + cfg.LAMBDA_SYN * syn_loss
                 + moicv_reg_loss
             )
 
@@ -585,6 +510,7 @@ def main() -> None:
                 {
                     "distill_loss": f"{distill_loss.detach().cpu().item():.6f}",
                     "ce_loss": f"{ce_loss.detach().cpu().item():.6f}",
+                    "syn_loss": f"{syn_loss.detach().cpu().item():.6f}",
                     "moicv_loss": f"{moicv_reg_loss.detach().cpu().item():.6f}",
                     "total_loss": f"{total_loss.detach().cpu().item():.6f}",
                     "g_step": global_step,

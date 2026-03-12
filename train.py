@@ -266,35 +266,67 @@ def load_and_assign_experts(
     print(f"[INFO] 正在加载专家初始化权重：{expert_init_path}")
     init_state = torch.load(expert_init_path, map_location="cpu")
 
-    required_keys = {"E_attn_vis", "E_ffn_vis", "E_attn_text", "E_ffn_text"}
-    if not required_keys.issubset(init_state.keys()):
+    # 兼容两种格式：
+    # 1) 旧版：E_attn_vis / E_ffn_vis / E_attn_text / E_ffn_text，通常是 896 维，需要插值到 hidden_size
+    # 2) 新版：E_vis / E_text，已经是 hidden_size 维的 CAA 专家向量
+
+    has_old_keys = {"E_attn_vis", "E_ffn_vis", "E_attn_text", "E_ffn_text"}.issubset(
+        init_state.keys()
+    )
+    has_new_keys = {"E_vis", "E_text"}.issubset(init_state.keys())
+
+    if not (has_old_keys or has_new_keys):
         raise KeyError(
-            f"expert_init_tensors.pt 中缺少必要键：{required_keys - set(init_state.keys())}"
+            "expert_init_tensors.pt 中既不包含旧版键 "
+            "{'E_attn_vis','E_ffn_vis','E_attn_text','E_ffn_text'}，"
+            "也不包含新版键 {'E_vis','E_text'}，请检查初始化脚本。"
         )
 
-    # 从文件中取出 896 维的初始化张量（形状 [4, 896]）
-    E_attn_vis_896: torch.Tensor = init_state["E_attn_vis"]  # [4, 896]
-    E_ffn_vis_896: torch.Tensor = init_state["E_ffn_vis"]
-    E_attn_text_896: torch.Tensor = init_state["E_attn_text"]
-    E_ffn_text_896: torch.Tensor = init_state["E_ffn_text"]
+    if has_old_keys:
+        # ---- 旧格式：从 896 维插值到 hidden_size ----
+        E_attn_vis_896: torch.Tensor = init_state["E_attn_vis"]  # [4, 896]
+        E_ffn_vis_896: torch.Tensor = init_state["E_ffn_vis"]
+        E_attn_text_896: torch.Tensor = init_state["E_attn_text"]
+        E_ffn_text_896: torch.Tensor = init_state["E_ffn_text"]
 
-    print(f"[INFO] 原始专家维度（期望 896）：")
-    print(f"  - E_attn_vis:  {tuple(E_attn_vis_896.shape)}")
-    print(f"  - E_ffn_vis:   {tuple(E_ffn_vis_896.shape)}")
-    print(f"  - E_attn_text: {tuple(E_attn_text_896.shape)}")
-    print(f"  - E_ffn_text:  {tuple(E_ffn_text_896.shape)}")
+        print(f"[INFO] 原始专家维度（期望 896）：")
+        print(f"  - E_attn_vis:  {tuple(E_attn_vis_896.shape)}")
+        print(f"  - E_ffn_vis:   {tuple(E_ffn_vis_896.shape)}")
+        print(f"  - E_attn_text: {tuple(E_attn_text_896.shape)}")
+        print(f"  - E_ffn_text:  {tuple(E_ffn_text_896.shape)}")
 
-    # 使用 1D 线性插值将 896 -> hidden_size
-    E_attn_vis_resized = resize_expert_tensor(E_attn_vis_896, hidden_size)
-    E_ffn_vis_resized = resize_expert_tensor(E_ffn_vis_896, hidden_size)
-    E_attn_text_resized = resize_expert_tensor(E_attn_text_896, hidden_size)
-    E_ffn_text_resized = resize_expert_tensor(E_ffn_text_896, hidden_size)
+        # 使用 1D 线性插值将 896 -> hidden_size
+        E_attn_vis_resized = resize_expert_tensor(E_attn_vis_896, hidden_size)
+        E_ffn_vis_resized = resize_expert_tensor(E_ffn_vis_896, hidden_size)
+        E_attn_text_resized = resize_expert_tensor(E_attn_text_896, hidden_size)
+        E_ffn_text_resized = resize_expert_tensor(E_ffn_text_896, hidden_size)
 
-    print(f"[INFO] 拉伸后的专家维度（对齐 hidden_size={hidden_size}）：")
-    print(f"  - E_attn_vis:  {tuple(E_attn_vis_resized.shape)}")
-    print(f"  - E_ffn_vis:   {tuple(E_ffn_vis_resized.shape)}")
-    print(f"  - E_attn_text: {tuple(E_attn_text_resized.shape)}")
-    print(f"  - E_ffn_text:  {tuple(E_ffn_text_resized.shape)}")
+        print(f"[INFO] 拉伸后的专家维度（对齐 hidden_size={hidden_size}）：")
+        print(f"  - E_attn_vis:  {tuple(E_attn_vis_resized.shape)}")
+        print(f"  - E_ffn_vis:   {tuple(E_ffn_vis_resized.shape)}")
+        print(f"  - E_attn_text: {tuple(E_attn_text_resized.shape)}")
+        print(f"  - E_ffn_text:  {tuple(E_ffn_text_resized.shape)}")
+    else:
+        # ---- 新格式：E_vis / E_text 已经是 hidden_size 维的 CAA 向量 ----
+        E_vis: torch.Tensor = init_state["E_vis"]   # [4, H]
+        E_text: torch.Tensor = init_state["E_text"] # [4, H]
+
+        print(f"[INFO] 检测到新版专家格式：E_vis / E_text")
+        print(f"  - E_vis  shape:  {tuple(E_vis.shape)}")
+        print(f"  - E_text shape:  {tuple(E_text.shape)}")
+
+        if E_vis.size(1) != hidden_size or E_text.size(1) != hidden_size:
+            raise ValueError(
+                f"新版专家向量第二维必须等于 hidden_size={hidden_size}，"
+                f"当前 E_vis={E_vis.shape}, E_text={E_text.shape}"
+            )
+
+        # 新方案中，我们将同一模态下的 attn / ffn 专家初始化为同一组 CAA 向量，
+        # 由后续训练让路由和注入位置自行分化。
+        E_attn_vis_resized = E_vis
+        E_ffn_vis_resized = E_vis
+        E_attn_text_resized = E_text
+        E_ffn_text_resized = E_text
 
     with torch.no_grad():
         # 目标 dtype：保持与 MoICV 层参数一致（在高配版本中通常为 torch.bfloat16）
