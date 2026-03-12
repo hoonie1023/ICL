@@ -297,20 +297,21 @@ def main() -> None:
         hidden_size=hidden_size,
     )
 
-    # 构建带注入能力的 Wrapper（Student）
+    # 构建带注入能力的 Wrapper（Student）——在同一中间层注入 MoICV 向量
     wrapper = MoICV_Qwen_Wrapper(
         llm_model=model,
         moicv_layer=moicv_layer,
-        attn_inject_layer_idx=cfg.ATTN_INJECT_LAYER_IDX,
-        ffn_inject_layer_idx=cfg.FFN_INJECT_LAYER_IDX,
+        attn_inject_layer_idx=15,
+        ffn_inject_layer_idx=15,
     )
 
     # MoICV 正则 Loss
     moicv_loss_fn = MoICV_Loss(alpha=cfg.MOICV_ALPHA, beta=cfg.MOICV_BETA)
 
-    # 只优化 MoICV 层参数 + 注入强度因子 gamma_attn / gamma_ffn
+    # 仅优化 MoICV 路由网络参数（专家向量已被冻结）
+    trainable_params = filter(lambda p: p.requires_grad, moicv_layer.parameters())
     optimizer = torch.optim.AdamW(
-        list(moicv_layer.parameters()) + [wrapper.gamma_attn, wrapper.gamma_ffn],
+        trainable_params,
         lr=cfg.LEARNING_RATE,
         weight_decay=cfg.WEIGHT_DECAY,
     )
@@ -371,23 +372,26 @@ def main() -> None:
             teacher_texts.append(target_teacher_text)
             teacher_images.append(decode_image_field(target_raw.get("image", None)))
 
+            # 【修复点】：将 17 个独立字符串拼成真正的 16-shot 长上下文；Batch Size = 1
+            teacher_16shot_text = "\n\n".join(teacher_texts)
+
             # Teacher 前向（无梯度）
             with torch.no_grad():
                 teacher_inputs = processor(
-                    text=teacher_texts,
-                    images=teacher_images,
+                    text=[teacher_16shot_text],
+                    images=[teacher_images],  # 多图作为同一道题的上下文
                     return_tensors="pt",
                     padding=True,
                 )
                 teacher_inputs = {k: v.to(device) for k, v in teacher_inputs.items()}
 
                 teacher_outputs = model(**teacher_inputs)
-                teacher_logits_all = teacher_outputs.logits  # [B,S,V]
+                teacher_logits_all = teacher_outputs.logits  # [1,S,V]
 
-                # 仅保留 batch 中最后一条（Target）的完整序列 logits
-                teacher_logits_seq = teacher_logits_all[-1:, :, :]  # [1,S,V]
+                # 仅保留该样本的完整序列 logits
+                teacher_logits_seq = teacher_logits_all  # [1,S,V]
                 # 提前提取出 target 的 mask，防止后续被 del 掉
-                teacher_target_mask = teacher_inputs["attention_mask"][-1:].clone()
+                teacher_target_mask = teacher_inputs["attention_mask"].clone()
 
             # 释放 Teacher 中间张量，缓解显存压力
             del teacher_outputs, teacher_logits_all, teacher_inputs
